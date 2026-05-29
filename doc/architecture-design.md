@@ -1,14 +1,16 @@
-# Architecture Design: AI Quant Agent v1.2 MVP
+# Architecture Design: AI Quant Agent v1.4 MVP
 
 ## 1. System Overview
 
-AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用于追踪全球 Top 10 AI 公司，聚合每日新闻与金融数据，生成量化分析及交易建议，并通过 Human-in-the-Loop (HITL) 机制在模拟执行前要求人工审批。系统提供 **REST API** 与 **Web 前端**（Vue3 + Ant Design Vue），供人工查询推荐历史、审阅 AI 分析并点击确认/拒绝今日交易。所有分析结果持久化到 **SQLite** 数据库。
+AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用于追踪全球 Top 10 AI 公司，聚合每日新闻与金融数据。**分析师 Agent** 生成交易建议，**风控 Agent** 做 AI 审查（替代人工事前审批），通过后**自动模拟执行**买入/卖出。人工不事前审批，而是事后**撤销**已执行的交易，且**仅限当天的交易可撤销**。系统提供 **REST API** 与 **Web 前端**（Vue3 + Ant Design Vue），供人工查询推荐历史、查看 AI 风控结论、查看当日已执行交易并一键撤销。所有结果持久化到 **SQLite**。
 
 项目采用 **monorepo** 结构：`backend/`（Python/FastAPI/LangGraph）与 `frontend/`（Vue3）。
 
-整体编排是一个**带条件分支的状态机**（而非纯线性 DAG）。为支持 Web 审批工作流，**持久化节点前置到人工审批之前**：分析结果先以 `PENDING` 落库，审批后由 `Finalize` 节点更新状态。服务器模式下借助 LangGraph Checkpointer 支持「中断 → 审批 → 恢复」。
+整体编排是一个**带三个有界循环的状态机**：
+1. 结构化输出自修复（节点内）；2. 证据补充环（图循环）；3. 风控反思环（图循环）。
+这些「循环 + 条件分支 + 终止条件」正是 LangGraph 的核心价值所在。由于无人工中断，所有循环在单次 `invoke` 内同步完成，**不需要 Checkpointer**。
 
-> ⚠️ **免责声明：** 本系统仅用于技术研究与学习目的，所有分析结果与「交易操作」均为**模拟**，不构成任何投资建议。
+> ⚠️ **免责声明：** 本系统仅用于技术研究与学习目的，所有分析结果与「交易操作」均为**模拟**，且在 AI 风控后**自动执行**，不构成任何投资建议。
 
 ### 目标股票
 
@@ -34,16 +36,17 @@ AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | Language | Python 3.10+ | Runtime |
-| Framework | LangGraph 0.2+ | 状态图编排（条件分支 + HITL 中断） |
-| State Persistence | LangGraph SqliteSaver / AsyncSqliteSaver | Checkpointer，支持中断恢复 |
+| Framework | LangGraph 0.2+ | 状态图编排（**带循环 + 条件分支**） |
 | LLM Abstraction | LangChain 0.3+ | LLM 调用封装（结构化输出） |
-| LLM Provider | Anthropic Claude / OpenAI GPT-4o | 分析推理 |
+| LLM Provider | 默认 GLM (glm-5.1, Anthropic 兼容端点) / 官方 Anthropic / OpenAI | 分析师 / 风控双 Agent 推理 |
 | Data Validation | Pydantic v2 | LLM 结构化输出 & API 模型 |
 | API Framework | FastAPI + Uvicorn | REST API 服务（含 CORS） |
 | Database | SQLite + aiosqlite | 数据持久化（异步） |
 | Stock Data | yfinance | 实时股价与基础数据 |
-| News Search | Tavily / DuckDuckGo Search | 新闻抓取 |
+| News Search | Tavily / DuckDuckGo Search | 新闻抓取（含证据补充环） |
 | Config | python-dotenv | 环境变量管理 |
+
+> **相比 v1.3：** 图从线性流水线升级为带三个有界循环的状态机（见 §3）。仍无需 `langgraph-checkpoint-sqlite`——循环在单次 invoke 内完成。
 
 ### 2.2 Frontend (`frontend/`)
 
@@ -65,63 +68,72 @@ AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                Web Frontend (Vue3 + Ant Design Vue)              │
-│   推荐历史 / 待审批队列 / 运行详情·审阅（确认买入·拒绝）             │
+│   推荐历史(含风控结论) / 今日交易(撤销) / 运行详情(风控卡片)         │
 └───────────────────────────┬──────────────────────────────────────┘
                             │ axios (REST/JSON, /api, CORS)
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                     FastAPI Server Layer                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐    │
-│  │ /api/recom-  │  │ /api/runs/*  │  │ /api/run/trigger    │    │
-│  │ mendations/* │  │ (+pending,id)│  │ /api/run/{id}/approve│    │
-│  └──────┬───────┘  └──────┬───────┘  └──────────┬──────────┘    │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐ │
+│  │ /api/recom-  │  │ /api/runs/*  │  │ /api/trades/*           │ │
+│  │ mendations/* │  │ /api/run/... │  │ (today, cancel)         │ │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬──────────────┘ │
 └─────────┼─────────────────┼─────────────────────┼───────────────┘
           │                 │                     │
           ▼                 ▼                     ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                       Database Layer (SQLite)                     │
-│  ┌──────────────────┐  ┌──────────────────────────────────┐     │
-│  │  analysis_runs   │  │  recommendations (per ticker)    │     │
-│  └──────────────────┘  └──────────────────────────────────┘     │
-│  ┌──────────────────────────────────────────────────────┐       │
-│  │  langgraph checkpoints (SqliteSaver, thread_id=run_id)│       │
-│  └──────────────────────────────────────────────────────┘       │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐  │
+│  │ analysis_runs│  │ recommendations  │  │ trades (BUY/SELL)  │  │
+│  │ (+risk_*)    │  │                  │  │                    │  │
+│  └──────────────┘  └──────────────────┘  └────────────────────┘  │
 └──────────────────────────────────────────────────────────────────┘
           ▲                                           ▲
-          │ (query)                          (write PENDING then finalize)
+          │ (query / cancel trades)                   │ (write run + recs + trades)
           │                                           │
 ┌──────────────────────────────────────────────────────────────────┐
-│           LangGraph StateGraph (Conditional State Machine)        │
+│         LangGraph StateGraph (Multi-Agent, Bounded Loops)         │
 │                                                                   │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐      │
-│  │ News_Scraper │──▶│ Quant_Analyst│──▶│ Data_Persistence │      │
-│  │    _Node     │   │    _Node     │   │ (status=PENDING) │      │
-│  └──────────────┘   └──────────────┘   └────────┬─────────┘      │
-│                                                  ▼                │
-│                                        ┌──────────────────┐       │
-│                                        │ Human_Approval   │ ◀─HITL│
-│                                        │  _Node (interrupt)│      │
-│                                        └────────┬─────────┘       │
-│                                                 ▼                 │
-│                                        ┌──────────────────┐       │
-│                                        │ Finalize_Node    │       │
-│                                        │ (update status)  │       │
-│                                        └────────┬─────────┘       │
-│                                  conditional edge│                │
-│                            ┌─────────────────────┴───────┐        │
-│                        APPROVED                       REJECTED     │
-│                            ▼                              ▼        │
-│                  ┌──────────────────┐                   END        │
-│                  │ Mock_Execution   │                              │
-│                  └────────┬─────────┘                              │
-│                           ▼                                        │
-│                          END                                       │
+│  news_scraper ─▶ quant_analyst ◀──────────────┐                  │
+│                      │ (route_after_analyst)   │ risk_feedback    │
+│            ┌─────────┴──────────┐              │ (risk_rounds++)  │
+│       证据不足&未超轮          证据充分          │                  │
+│            ▼                    ▼              │                  │
+│   evidence_gatherer ──回到──▶ risk_reviewer ───┘ (驳回&未超轮)     │
+│   (evidence_rounds++)             │ (route_after_risk)            │
+│                       ┌───────────┴────────────┐                 │
+│                  通过 / 轮次用尽            （上面的回边）           │
+│                       ▼                                           │
+│              data_persistence ─▶ auto_execution ─▶ END           │
 │                                                                   │
-│  任意节点异常 ──▶ Error_Handler_Node (status=ERROR) ──▶ END        │
+│  schema 校验失败 → quant_analyst 内部重试（≤ MAX_SCHEMA_RETRIES）  │
+│  任意节点异常 ─▶ error_handler (status=ERROR) ─▶ END               │
 └──────────────────────────────────────────────────────────────────┘
+
+事后人工撤销（不属于图流程）：
+  Frontend「今日交易」 ─▶ POST /api/trades/{id}/cancel ─▶ 校验当日 ─▶ trades.status=CANCELLED
 ```
 
-> **关键变更（v1.2）：** 持久化节点移至审批之前（写入 `PENDING`），新增 `Finalize_Node` 在审批后更新 run 状态。这样前端在审批前即可查询并展示分析内容。
+> **关键变更（v1.4）：** 引入 `Evidence_Gatherer_Node` 与 `Risk_Reviewer_Node`（独立风控 Agent）及两条回边，构成三个有界循环；`analysis_runs` 增加 `risk_verdict` / `risk_rounds` / `evidence_rounds` / `review_notes`。
+
+### 3.1 三个有界循环
+
+| 循环 | 类型 | 触发 / 终止 | 上限 |
+|------|------|------------|------|
+| 结构化输出自修复 | 节点内 | schema 校验失败带反馈重试；合法或超限即停 | `MAX_SCHEMA_RETRIES`（默认 2） |
+| 证据补充环 | 图循环 | `needs_more_evidence` 非空且未超限 → evidence_gatherer → 回 analyst | `MAX_EVIDENCE_ROUNDS`（默认 2） |
+| 风控反思环 | 图循环 | 风控驳回且未超限 → 带 feedback 回 analyst | `MAX_RISK_ROUNDS`（默认 3） |
+
+### 3.2 路由函数
+
+- `route_after_analyst(state)`：`needs_more_evidence` 非空且 `evidence_rounds < MAX_EVIDENCE_ROUNDS` → `evidence_gatherer`；否则 → `risk_reviewer`。
+- `route_after_risk(state)`：`risk_review.approved` → `data_persistence`；否则若 `risk_rounds < MAX_RISK_ROUNDS` → `quant_analyst`（带 risk_feedback）；否则（轮次用尽）→ `data_persistence`（`risk_verdict=REJECTED_AT_LIMIT`）。
+
+### 3.3 轮次用尽策略
+
+`RISK_LIMIT_POLICY` 配置：
+- `EXECUTE_AND_FLAG`（默认）：风控未通过仍执行，run 标 `risk_verdict=REJECTED_AT_LIMIT`，前端警示，人工可当日撤销。
+- `DOWNGRADE_TO_HOLD`：被风控否决的 BUY/SELL 降级为 HOLD，不下单；其余正常执行。
 
 ---
 
@@ -135,9 +147,9 @@ AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用
 ├─────────────────────────────────────┤
 │           Presentation Layer         │  FastAPI endpoints, CORS, CLI I/O, report formatting
 ├─────────────────────────────────────┤
-│           Orchestration Layer        │  LangGraph StateGraph, conditional edges, checkpointer
+│           Orchestration Layer        │  LangGraph StateGraph（多 Agent + 有界循环 + 条件路由）
 ├─────────────────────────────────────┤
-│           Business Logic Layer       │  News scraping, quant analysis, finalize, execution
+│           Business Logic Layer       │  scraping, analysis, evidence-gathering, risk-review, auto-exec, cancel
 ├─────────────────────────────────────┤
 │           Data Access Layer          │  SQLite repository, CRUD operations
 ├─────────────────────────────────────┤
@@ -151,27 +163,27 @@ AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用
 
 | Module | Responsibility |
 |--------|---------------|
-| `config/` | 环境变量加载、常量定义、LLM 客户端初始化 |
-| `models/` | State TypedDict、Pydantic 模型定义 |
-| `nodes/` | 各 Graph Node 的实现（纯函数，接收 State 返回新 State） |
-| `graph/` | StateGraph 构建、条件边连接、checkpointer 编译 |
+| `config/` | 环境变量加载、常量定义（含三个循环上限/风控策略）、LLM 客户端初始化 |
+| `models/` | State TypedDict、Pydantic 模型定义（分析师 + 风控） |
+| `nodes/` | 各 Graph Node 实现 + 路由函数 |
+| `graph/` | StateGraph 构建（节点 + 条件边/回边）与编译 |
 | `tools/` | yfinance、Tavily/DuckDuckGo 的封装 |
-| `prompts/` | LLM prompt 模板 |
-| `db/` | SQLite 连接管理、数据库初始化、Repository 模式数据访问 |
-| `api/` | FastAPI 路由定义、请求/响应模型、CORS、依赖注入 |
-| `utils/` | 格式化、错误处理等工具函数 |
+| `prompts/` | 分析师 / 风控 prompt 模板 |
+| `db/` | SQLite 连接管理、数据库初始化、Repository（runs / recs / trades） |
+| `api/` | FastAPI 路由、请求/响应模型、CORS、依赖注入 |
+| `utils/` | 格式化、当日判定、错误处理等 |
 | `tests/` | 单元测试、集成测试 |
 
 ### 4.3 Frontend Module Responsibilities
 
 | Module | Responsibility |
 |--------|---------------|
-| `api/` | axios 实例、拦截器、按资源划分的 API 调用封装 |
-| `types/` | 与后端响应模型对应的 TypeScript 类型 |
-| `stores/` | Pinia stores（runs、recommendations） |
+| `api/` | axios 实例、拦截器、按资源划分的 API 封装（runs / recommendations / trades） |
+| `types/` | 与后端响应模型对应的 TS 类型（含 RiskReview） |
+| `stores/` | Pinia stores（runs、recommendations、trades） |
 | `router/` | 路由表 |
-| `views/` | 页面：HistoryView、PendingView、RunDetailView |
-| `components/` | 复用组件：RunTable、RecommendationTable、ActionTag、ApprovalBar |
+| `views/` | HistoryView、TodayTradesView、RunDetailView |
+| `components/` | RunTable、RecommendationTable、TradeTable、RiskReviewCard、ActionTag、CancelButton |
 | `App.vue` / `main.ts` | 布局、Ant Design Vue 注册、应用入口 |
 
 ---
@@ -182,20 +194,23 @@ AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用
 
 ### 5.1 Schema
 
-**analysis_runs** — 分析运行记录
+**analysis_runs** — 分析运行记录（含 AI 风控结论）
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
-| id | TEXT | PK | UUID（同时用作 LangGraph thread_id） |
+| id | TEXT | PK | UUID |
 | run_date | TEXT | NOT NULL | 运行日期 (YYYY-MM-DD) |
-| status | TEXT | NOT NULL | "PENDING", "APPROVED", "REJECTED", "ERROR" |
+| status | TEXT | NOT NULL | "EXECUTED", "ERROR" |
+| risk_verdict | TEXT | | "APPROVED" / "REJECTED_AT_LIMIT"（ERROR 时可空） |
+| risk_rounds | INTEGER | NOT NULL DEFAULT 0 | 风控反思环轮数 |
+| evidence_rounds | INTEGER | NOT NULL DEFAULT 0 | 证据补充环轮数 |
+| review_notes | TEXT | | 风控最终意见摘要（nullable） |
 | error_message | TEXT | | 错误原因（仅 status=ERROR，nullable） |
 | created_at | TEXT | NOT NULL | ISO 8601 创建时间 |
-| approved_at | TEXT | | ISO 8601 审批时间 (nullable) |
 
-> **状态流转：** 创建时 `PENDING`（数据已写入）→ 审批后 `APPROVED`/`REJECTED` → 异常 `ERROR`。
+> **状态流转：** 自动跑完为 `EXECUTED`（risk_verdict=APPROVED 或 REJECTED_AT_LIMIT），异常为 `ERROR`；撤销交易不改变 run 状态/风控结论。
 
-**recommendations** — 逐 ticker 分析结果
+**recommendations** — 逐 ticker 分析结果（含 HOLD，存最终修订版）
 
 | Column | Type | Constraints | Description |
 |--------|------|-------------|-------------|
@@ -209,7 +224,21 @@ AI Quant Agent 是一个基于 LangGraph + LangChain 的多智能体系统，用
 | price_at_analysis | REAL | NOT NULL | 分析时股价 |
 | created_at | TEXT | NOT NULL | ISO 8601 创建时间 |
 
-> **设计说明：** `recommendations` 冗余 `run_date`，按日期查询可走单表索引，无需 join `analysis_runs`。
+**trades** — 由 BUY/SELL 自动执行产生的模拟交易（可撤销）
+
+| Column | Type | Constraints | Description |
+|--------|------|-------------|-------------|
+| id | INTEGER | PK, AUTO | 自增主键 |
+| run_id | TEXT | FK → analysis_runs.id, ON DELETE CASCADE | 关联运行记录 |
+| run_date | TEXT | NOT NULL | 冗余运行日期，「当日撤销」判定 + 按日期查询 |
+| ticker | TEXT | NOT NULL | 股票代码 |
+| side | TEXT | NOT NULL, CHECK(BUY/SELL) | 交易方向 |
+| price | REAL | NOT NULL | 执行价格 |
+| status | TEXT | NOT NULL, CHECK(EXECUTED/CANCELLED) | 交易状态 |
+| executed_at | TEXT | NOT NULL | ISO 8601 执行时间 |
+| cancelled_at | TEXT | | ISO 8601 撤销时间 (nullable) |
+
+> **设计说明：** AI 风控逐条 issues 的 MVP 做法是序列化进 `review_notes`；后续可拆出独立 `risk_issues` 表（FK run_id）。三表均冗余 `run_date`，按日期/当日查询走单表索引、免 join。
 
 ### 5.2 Indexes
 
@@ -218,8 +247,13 @@ CREATE INDEX idx_recommendations_run_id      ON recommendations(run_id);
 CREATE INDEX idx_recommendations_ticker      ON recommendations(ticker);
 CREATE INDEX idx_recommendations_run_date    ON recommendations(run_date);
 CREATE INDEX idx_recommendations_ticker_date ON recommendations(ticker, run_date);
+CREATE INDEX idx_trades_run_id               ON trades(run_id);
+CREATE INDEX idx_trades_run_date             ON trades(run_date);
+CREATE INDEX idx_trades_ticker               ON trades(ticker);
+CREATE INDEX idx_trades_status               ON trades(status);
 CREATE INDEX idx_analysis_runs_date          ON analysis_runs(run_date);
 CREATE INDEX idx_analysis_runs_status        ON analysis_runs(status);
+CREATE INDEX idx_analysis_runs_risk_verdict  ON analysis_runs(risk_verdict);
 ```
 
 ### 5.3 ER Diagram
@@ -228,16 +262,17 @@ CREATE INDEX idx_analysis_runs_status        ON analysis_runs(status);
 ┌──────────────────────┐       ┌──────────────────────────┐
 │  analysis_runs       │       │    recommendations        │
 ├──────────────────────┤       ├──────────────────────────┤
-│ id (PK)        TEXT  │───┐   │ id (PK)         INTEGER  │
-│ run_date       TEXT  │   │   │ run_id (FK)     TEXT     │◀─┐
-│ status         TEXT  │   └──▶│ run_date        TEXT     │  │ ON DELETE
-│ error_message  TEXT  │       │ ticker          TEXT     │  │ CASCADE
-│ created_at     TEXT  │       │ reasoning       TEXT     │  │
-│ approved_at    TEXT  │       │ sentiment_score INTEGER  │  │
-└──────────────────────┘       │ action          TEXT     │  │
-                               │ price_at_analysis REAL   │  │
-                               │ created_at      TEXT     │  │
-                               └──────────────────────────┘  │
+│ id (PK)        TEXT  │───┬──▶│ run_id (FK)     TEXT     │ ON DELETE CASCADE
+│ run_date       TEXT  │   │   │ run_date / ticker / ...  │
+│ status         TEXT  │   │   └──────────────────────────┘
+│ risk_verdict   TEXT  │   │   ┌──────────────────────────┐
+│ risk_rounds    INT   │   │   │    trades                 │
+│ evidence_rounds INT  │   └──▶│ run_id (FK)     TEXT     │ ON DELETE CASCADE
+│ review_notes   TEXT  │       │ run_date / ticker        │
+│ error_message  TEXT  │       │ side / price             │
+│ created_at     TEXT  │       │ status / executed_at     │
+└──────────────────────┘       │ cancelled_at             │
+                               └──────────────────────────┘
 ```
 
 ---
@@ -252,44 +287,42 @@ CREATE INDEX idx_analysis_runs_status        ON analysis_runs(status);
 | GET | `/api/recommendations/{date}` | 指定日期全部建议 | None (MVP) |
 | GET | `/api/recommendations/ticker/{ticker}/latest` | 指定 ticker 最新建议 | None (MVP) |
 | GET | `/api/recommendations/ticker/{ticker}/history` | 指定 ticker 历史建议（分页） | None (MVP) |
-| POST | `/api/run/trigger` | 手动触发分析运行（异步，202 + run_id） | None (MVP) |
-| GET | `/api/runs` | 列出所有分析运行（分页，支持 status/date 筛选） | None (MVP) |
-| GET | `/api/runs/{run_id}` | 查询指定 run 的状态、详情及其全部 recommendations | None (MVP) |
-| GET | `/api/runs/pending` | 获取待审批（PENDING）队列 | None (MVP) |
-| POST | `/api/run/{run_id}/approve` | 提交审批结果，恢复中断的图执行 | None (MVP) |
+| POST | `/api/run/trigger` | 触发分析运行（异步，202 + run_id；跑完三循环 + 执行） | None (MVP) |
+| GET | `/api/runs` | 列出分析运行（分页，status/date/risk_verdict 筛选） | None (MVP) |
+| GET | `/api/runs/{run_id}` | run 状态 + 风控结论 + recommendations + trades | None (MVP) |
+| GET | `/api/trades/today` | 当天已执行、可撤销的交易列表 | None (MVP) |
+| GET | `/api/trades` | 列出交易（分页，run_id/ticker/status/date 筛选） | None (MVP) |
+| POST | `/api/trades/{trade_id}/cancel` | 撤销单笔交易（仅当天） | None (MVP) |
+| POST | `/api/runs/{run_id}/cancel` | 批量撤销该 run 当天未撤销的交易 | None (MVP) |
 
 ### 6.2 Response Envelope
 
-所有 API 响应使用统一的信封格式；分页类接口在 `meta` 中携带 `total / page / page_size / total_pages`：
+统一信封；分页类在 `meta` 携带 `total / page / page_size / total_pages`：
 
 ```json
-{
-  "success": true,
-  "data": {},
-  "error": null,
-  "meta": {}
-}
+{ "success": true, "data": {}, "error": null, "meta": {} }
 ```
 
-失败响应通过 `error.code` + `error.message` 返回结构化错误。
+失败响应通过 `error.code` + `error.message` 返回。
 
 ### 6.3 Error Codes
 
 | HTTP | error.code | 说明 |
 |------|------------|------|
 | 400 | `INVALID_PARAMETER` | 参数非法（如日期格式错误） |
-| 400 | `INVALID_DECISION` | 审批结果非法 |
 | 404 | `RESOURCE_NOT_FOUND` | 日期/ticker 无数据 |
 | 404 | `RUN_NOT_FOUND` | run_id 不存在 |
-| 409 | `RUN_NOT_PENDING` | run 当前不处于待审批状态 |
-| 422 | `VALIDATION_ERROR` | 请求体校验失败 |
+| 404 | `TRADE_NOT_FOUND` | trade_id 不存在 |
+| 409 | `TRADE_NOT_CANCELLABLE` | 交易非当日、或已撤销，不可撤销 |
+| 422 | `VALIDATION_ERROR` | 请求参数校验失败 |
 | 500 | `INTERNAL_ERROR` | 服务内部错误 |
 | 502 | `UPSTREAM_ERROR` | 上游依赖（yfinance/搜索/LLM）失败 |
 
-### 6.4 Pagination & CORS
+### 6.4 Pagination, Cancellation & CORS
 
-- 分页接口（`/recommendations/ticker/{ticker}/history`、`/runs`）统一支持 `page`（默认 1）与 `page_size`（默认 20，最大 100），`/runs` 额外支持 `status`、`date` 筛选。
-- 服务器模式启用 `CORSMiddleware`，允许的来源由环境变量 `CORS_ORIGINS` 配置（默认 `http://localhost:5173`）。
+- 分页接口（`/recommendations/ticker/{ticker}/history`、`/runs`、`/trades`）统一支持 `page`（默认 1）与 `page_size`（默认 20，最大 100）。`/runs` 额外支持 `status`、`date`、`risk_verdict`；`/trades` 额外支持 `run_id`、`ticker`、`status`、`date`。
+- **撤销规则（当日限制）：** 交易可撤销当且仅当存在、`run_date == 服务器当天`、且 `status == EXECUTED`；否则 `404 TRADE_NOT_FOUND` / `409 TRADE_NOT_CANCELLABLE`。撤销只改 `trades`，不改写 `recommendations` / `analysis_runs`（审计可追溯）。run 级批量撤销跳过不满足条件者并返回实际撤销数量。
+- 服务器模式启用 `CORSMiddleware`，允许来源由 `CORS_ORIGINS` 配置（默认 `http://localhost:5173`）。
 
 ---
 
@@ -299,70 +332,69 @@ CREATE INDEX idx_analysis_runs_status        ON analysis_runs(status);
 
 | Page | Route | Purpose |
 |------|-------|---------|
-| HistoryView | `/` / `/history` | 推荐历史列表（分页、status/date 筛选），点击进入详情 |
-| PendingView | `/pending` | 待审批队列（status=PENDING） |
-| RunDetailView | `/runs/:runId` | 运行详情/审阅；PENDING 时显示「确认买入/拒绝」按钮 |
+| HistoryView | `/` / `/history` | 推荐历史列表（分页、status/date/risk_verdict 筛选），点击进详情 |
+| TodayTradesView | `/today` | 当天已执行交易，「撤销」按钮（仅当天） |
+| RunDetailView | `/runs/:runId` | run 详情：风控卡片 + recommendations + trades；当天 trade 可撤销 |
 
-### 7.2 Approval Flow (前后端)
+### 7.2 Pipeline + Cancel Flow (前后端)
 
 ```
-User → PendingView → 点击某 run → RunDetailView
-        │                              │ GET /api/runs/{run_id}
-        │                              ▼
-        │                         展示每只股票建议/推理/价格
-        │                              │ 点击「确认买入」或「拒绝」
-        │                              ▼
-        │                  POST /api/run/{run_id}/approve {decision}
-        │                              │
-        ▼                              ▼
-   列表刷新                   后端恢复图执行 → Finalize → (Mock_Execution|END)
-                                       │
-                                       ▼
-                            前端刷新展示最终状态（APPROVED/REJECTED）
+触发分析 (POST /api/run/trigger, 202)
+        │  后台跑完：抓取 →(分析↔证据补充)→(分析↔风控反思)→ 落库 → 自动执行
+        │  风控通过 → risk_verdict=APPROVED；轮次用尽 → REJECTED_AT_LIMIT(+警示)
+        ▼
+RunDetailView ── GET /api/runs/{id} ──▶ 风控卡片(issues/notes) + 推荐 + 交易
+TodayTradesView ── GET /api/trades/today ──▶ 当天交易
+        │ 点击「撤销」(a-popconfirm)
+        ▼
+POST /api/trades/{trade_id}/cancel
+        ├── 通过 → status=CANCELLED → 列表刷新
+        └── 不通过 → 409 / 404 → message 提示
 ```
 
 ### 7.3 Dev Proxy & Types
 
-- Vite dev server 将 `/api` 代理到 `http://localhost:8000`，开发期免 CORS；后端 `CORSMiddleware` 作为兜底。
-- 前端 TypeScript 类型与后端 Pydantic 响应模型一一对应（`ApiResponse<T>`、`RunOut`、`RecommendationOut`、`PaginationMeta`）。
-- axios 响应拦截器统一解析信封，遇到 `success=false` 抛出错误并由调用方/全局提示处理。
+- Vite dev server 将 `/api` 代理到 `http://localhost:8000`；后端 `CORSMiddleware` 兜底。
+- 前端 TS 类型与后端 Pydantic 模型一一对应（`ApiResponse<T>`、`RunOut`/`RunDetailOut`、`RecommendationOut`、`TradeOut`、`RiskReviewOut`、`PaginationMeta`）。
+- axios 响应拦截器统一解析信封，`success=false` 抛错并提示。
+- 「当天可撤销」由后端权威判定（`TradeOut.cancellable`）；前端据此控制按钮可用性。
 
 ---
 
 ## 8. State Flow
 
 ```
-AgentState
+AgentState（关键字段）
 ┌────────────────────────────────────────────────────────────┐
-│ tickers: ["AAPL", "MSFT", ...]                             │
-│ raw_news_data: {} ──▶ {"AAPL": {price, news}, ...}        │
-│ analyses: [] ──▶ [{ticker, reasoning, score, action, price}]│
-│ analysis_report: "" ──▶ "formatted report"                 │
-│ approval_status: "PENDING" ──▶ APPROVED/REJECTED/ERROR     │
-│ run_id: <uuid> (= thread_id, 初始化生成)                    │
-│ error_message: None ──▶ "..." (on error)                  │
+│ raw_news_data        ──▶ 证据补充环会追加更新                  │
+│ analyses             ──▶ 分析师每轮修订                        │
+│ needs_more_evidence  ──▶ 触发证据补充环                        │
+│ evidence_rounds      ──▶ 证据环计数（终止条件）                │
+│ risk_review          ──▶ 风控结论（approved/issues/notes）     │
+│ risk_feedback        ──▶ 驳回时回传分析师                      │
+│ risk_rounds          ──▶ 风控环计数（终止条件）                │
+│ risk_verdict         ──▶ APPROVED / REJECTED_AT_LIMIT         │
+│ executed_trades      ──▶ 自动执行的 BUY/SELL                  │
+│ run_id / error_message                                       │
 └────────────────────────────────────────────────────────────┘
 
-Node 1 (News_Scraper)     ──▶  fills raw_news_data (news + price)
-Node 2 (Quant_Analyst)    ──▶  fills analyses + analysis_report
-Node 3 (Data_Persistence) ──▶  写入 analysis_runs(PENDING) + recommendations
-Node 4 (Human_Approval)   ──▶  interrupt；注入 approval_status
-Node 5 (Finalize)         ──▶  更新 run 状态 (APPROVED/REJECTED, approved_at)
-        │ conditional edge
-        ├── APPROVED ─▶ Node 6 (Mock_Execution) ─▶ END
-        └── REJECTED ─▶ END
-Node E (Error_Handler)    ──▶  on exception: status=ERROR, fills error_message
+news_scraper      ─▶ raw_news_data
+quant_analyst     ─▶ analyses + needs_more_evidence (+ 消费 risk_feedback)
+  ├─(证据不足&未超轮)─▶ evidence_gatherer ─▶ raw_news_data 更新, evidence_rounds++ ─▶ 回 quant_analyst
+  └─(证据充分)──────▶ risk_reviewer ─▶ risk_review
+        ├─(通过)──────────────▶ data_persistence ─▶ auto_execution ─▶ END
+        ├─(驳回&未超轮)────────▶ risk_feedback, risk_rounds++ ─▶ 回 quant_analyst
+        └─(驳回&轮次用尽)──────▶ risk_verdict=REJECTED_AT_LIMIT ─▶ data_persistence ─▶ auto_execution ─▶ END
+error_handler     ─▶ status=ERROR
 ```
 
 ### State Immutability
 
-每个 Node 返回一个 **新的 State partial dict**，LangGraph 自动合并到当前 State。Node 内部不修改传入的 State 对象：
+每个 Node 返回 **新的 State partial dict**，LangGraph 自动合并：
 
 ```python
 def news_scraper_node(state: AgentState) -> dict:
-    tickers = state["tickers"]
-    news_data = fetch_all_news(tickers)
-    return {"raw_news_data": news_data}
+    return {"raw_news_data": fetch_all_news(state["tickers"])}
 ```
 
 ---
@@ -373,7 +405,6 @@ def news_scraper_node(state: AgentState) -> dict:
 ┌──────────────┐
 │  Node Error  │
 └──────┬───────┘
-       │
        ▼
 ┌─────────────────────┐    YES    ┌──────────────────┐
 │ Retriable? (network)│──────────▶│ Retry with backoff│
@@ -384,17 +415,17 @@ def news_scraper_node(state: AgentState) -> dict:
 │ Route to Error_Handler_Node │
 │  - set status = "ERROR"     │
 │  - persist error_message    │
-│  - safe end of run          │
 └─────────────────────────────┘
 ```
 
-- **API 调用失败**：重试 3 次，指数退避；超过上限路由到 Error_Handler。
-- **LLM 输出解析失败**：依赖 Pydantic 结构化输出 + 重试 1 次；仍失败回退默认 HOLD 或标记 ERROR。
-- **数据库写入失败**：记录日志并标记 run 状态，避免静默丢失。
-- **用户输入无效**：CLI 循环提示直到输入 Y/N；API 端返回 `INVALID_DECISION`。
-- **超时控制**：所有网络/LLM 调用设置超时，防止单次 run 长时间挂起。
-- **部分失败**：单个 ticker 抓取失败可记录状态并继续处理其余 ticker。
-- **前端**：统一拦截 `error`，用 Ant Design `message`/`notification` 提示。
+- **API 调用失败**：重试 3 次，指数退避；超限路由到 Error_Handler。
+- **LLM 结构化输出失败**：结构化输出自修复循环（≤ MAX_SCHEMA_RETRIES）；仍失败 → ERROR。
+- **循环防失控**：三个循环均有硬上限，路由函数基于 `*_rounds` 计数终止。
+- **数据库写入失败**：记录日志并标记 run 状态。
+- **自动执行/撤销**：使用事务；撤销严格校验「当日 + EXECUTED」。
+- **超时控制**：所有网络/LLM 调用设置超时。
+- **部分失败**：单 ticker 抓取失败可记录并继续。
+- **前端**：统一拦截 `error` 提示；`REJECTED_AT_LIMIT` 给醒目警示。
 
 ---
 
@@ -402,13 +433,17 @@ def news_scraper_node(state: AgentState) -> dict:
 
 | Concern | Mitigation |
 |---------|-----------|
-| API Keys | 通过 `.env` 文件管理，`.gitignore` 排除，提供 `.env.example` 模板 |
+| API Keys | `.env` 管理，`.gitignore` 排除，提供 `.env.example` |
 | LLM Prompt Injection | 新闻内容只作为 data context，不注入 system prompt |
-| Input Validation | Human Approval 仅接受 Y/N；API 路径/请求体经 Pydantic 校验 |
-| Rate Limiting | 对外部 API 设置速率限制与重试退避，避免限流/封禁 |
-| SQL Injection | 使用参数化查询，Repository 模式 |
+| Input Validation | API 路径/请求参数经 Pydantic / FastAPI 校验 |
+| Auto-Execution Risk | AI 风控前置把关 + 轮次用尽标记/降级；撤销受「当日」严格约束，事务保证一致性 |
+| Loop Abuse | 三循环硬上限，防止 LLM 驱动的无限循环耗尽配额 |
+| Rate Limiting | 对外部 API 设置速率限制与重试退避 |
+| SQL Injection | 参数化查询，Repository 模式 |
 | CORS | 服务器模式限定允许来源（CORS_ORIGINS） |
-| API Auth | MVP 阶段无认证（前端也无登录）；预留中间件接口供后续添加 |
+| API Auth | MVP 无认证；预留中间件接口 |
+
+> **注意：** 自动执行 + 无鉴权意味着任何能访问 API 的人都可触发分析与撤销。生产化前应至少加入鉴权与操作审计。AI 风控降低但不消除错误交易风险。
 
 ---
 
@@ -421,7 +456,7 @@ cd backend
 python -m src.main
 ```
 
-交互式单次运行：抓取→分析→写入 PENDING→`interrupt_before` 中断，控制台打印报告并等待 HITL 审批（Y/N），Finalize 更新状态后按结果走 APPROVED/REJECTED 分支。
+非交互单次运行：抓取 →(分析↔证据补充)→(分析↔风控反思)→ 落库 → 自动执行 → 打印风控结论与已执行交易 → 退出。
 
 ### 11.2 Server Mode
 
@@ -430,11 +465,8 @@ cd backend
 python -m src.main --serve [--port 8000]
 ```
 
-启动 FastAPI 服务，供前端与外部系统使用：
-- `POST /api/run/trigger` **异步**启动分析（后台任务），立即返回 `202 Accepted` + `run_id`。
-- 后台分析写入 `PENDING` 数据后，执行到 `Human_Approval_Node` 中断。
-- 前端轮询 `/api/runs/pending` 或 `/api/runs/{run_id}` 展示分析内容，再通过 `POST /api/run/{run_id}/approve` 提交结果。
-- 系统基于 **Checkpointer** 和 `thread_id`（= run_id）恢复执行，服务重启后 PENDING 的 run 仍可恢复。
+- `POST /api/run/trigger` **异步**启动分析（后台任务），立即返回 `202 Accepted` + `run_id`；后台**完整跑完**（三循环 + 自动执行）。
+- 前端通过 `/api/runs`、`/api/runs/{run_id}`、`/api/trades/today` 查询，并对当天交易执行撤销。
 
 ### 11.3 Frontend Dev
 
@@ -467,49 +499,54 @@ ai-stock-assistant/
 │   │   ├── __init__.py
 │   │   ├── main.py                 # CLI + Server 入口
 │   │   ├── config/
-│   │   │   ├── settings.py         # 环境变量 & 常量（含 CORS_ORIGINS）
+│   │   │   ├── settings.py         # 环境变量 & 常量（CORS、循环上限、风控策略）
 │   │   │   └── llm.py              # LLM 客户端工厂
 │   │   ├── models/
-│   │   │   ├── state.py            # AgentState / TickerNews / TickerAnalysis
-│   │   │   └── schemas.py          # Pydantic API request/response models
+│   │   │   ├── state.py            # AgentState + TickerNews/TickerAnalysis/RiskReview/TradeExecution
+│   │   │   └── schemas.py          # Pydantic API + LLM models（QuantReport / RiskReview / TradeOut ...）
 │   │   ├── nodes/
 │   │   │   ├── news_scraper.py     # Node 1
-│   │   │   ├── quant_analyst.py    # Node 2
-│   │   │   ├── data_persistence.py # Node 3 (前置, 写 PENDING)
-│   │   │   ├── human_approval.py   # Node 4
-│   │   │   ├── finalize.py         # Node 5 (更新状态) (NEW)
-│   │   │   ├── mock_execution.py   # Node 6
-│   │   │   └── error_handler.py    # Node E
+│   │   │   ├── quant_analyst.py    # Node 2（含 schema 自修复）
+│   │   │   ├── evidence_gatherer.py# Node 3（证据补充环）(NEW)
+│   │   │   ├── risk_reviewer.py    # Node 4（风控 Agent）(NEW)
+│   │   │   ├── data_persistence.py # Node 5
+│   │   │   ├── auto_execution.py   # Node 6
+│   │   │   ├── error_handler.py    # Node E
+│   │   │   └── routing.py          # route_after_analyst / route_after_risk (NEW)
 │   │   ├── graph/
-│   │   │   ├── builder.py          # StateGraph 构建（条件边）
-│   │   │   └── checkpointer.py     # SqliteSaver/AsyncSqliteSaver 工厂
+│   │   │   └── builder.py          # StateGraph 构建（节点 + 条件边/回边）
 │   │   ├── tools/
 │   │   │   ├── stock_data.py       # yfinance 封装
 │   │   │   └── news_search.py      # Tavily/DuckDuckGo 封装
 │   │   ├── db/
 │   │   │   ├── connection.py       # SQLite 连接管理
-│   │   │   ├── init_db.py          # 建表 & 索引初始化
-│   │   │   └── repository.py       # 数据访问层 (CRUD)
+│   │   │   ├── init_db.py          # 建表 & 索引（含 risk_* 列 + trades）
+│   │   │   └── repository.py       # 数据访问层 (runs / recs / trades)
 │   │   ├── api/
 │   │   │   ├── app.py              # FastAPI app factory（含 CORS）
 │   │   │   ├── routes/
 │   │   │   │   ├── recommendations.py
-│   │   │   │   └── runs.py          # 运行管理 + 审批路由
+│   │   │   │   ├── runs.py          # 运行管理 + run 级撤销
+│   │   │   │   └── trades.py        # 交易查询 + 撤销
 │   │   │   └── dependencies.py     # 依赖注入
 │   │   ├── prompts/
-│   │   │   └── quant_analyst.py
+│   │   │   ├── quant_analyst.py    # 分析师 prompt
+│   │   │   └── risk_reviewer.py    # 风控 prompt (NEW)
 │   │   └── utils/
-│   │       └── formatting.py
+│   │       ├── formatting.py
+│   │       └── dates.py            # 当日判定工具
 │   └── tests/
 │       ├── test_news_scraper.py
 │       ├── test_quant_analyst.py
+│       ├── test_evidence_gatherer.py   # (NEW)
+│       ├── test_risk_reviewer.py       # (NEW)
+│       ├── test_routing.py             # 路由/循环终止 (NEW)
 │       ├── test_data_persistence.py
-│       ├── test_human_approval.py
-│       ├── test_finalize.py
-│       ├── test_mock_execution.py
+│       ├── test_auto_execution.py
 │       ├── test_error_handler.py
 │       ├── test_graph_builder.py
 │       ├── test_repository.py
+│       ├── test_trades_cancel.py
 │       └── test_api.py
 │
 └── frontend/                       # Vue3 + Ant Design Vue
@@ -526,20 +563,24 @@ ai-stock-assistant/
         │   └── index.ts
         ├── api/
         │   ├── client.ts           # axios 实例 + 拦截器
-        │   ├── runs.ts             # runs / approve / trigger API
-        │   └── recommendations.ts  # recommendations API
+        │   ├── runs.ts             # runs / trigger / run 级 cancel API
+        │   ├── recommendations.ts  # recommendations API
+        │   └── trades.ts           # trades / today / cancel API
         ├── types/
-        │   └── index.ts            # ApiResponse / RunOut / RecommendationOut 等
+        │   └── index.ts            # ApiResponse / RunOut / RecommendationOut / TradeOut / RiskReview
         ├── stores/
-        │   ├── runs.ts             # Pinia store
-        │   └── recommendations.ts
+        │   ├── runs.ts
+        │   ├── recommendations.ts
+        │   └── trades.ts
         ├── views/
         │   ├── HistoryView.vue
-        │   ├── PendingView.vue
+        │   ├── TodayTradesView.vue
         │   └── RunDetailView.vue
         └── components/
             ├── RunTable.vue
             ├── RecommendationTable.vue
+            ├── TradeTable.vue
+            ├── RiskReviewCard.vue  # AI 风控结论卡片 (NEW)
             ├── ActionTag.vue
-            └── ApprovalBar.vue
+            └── CancelButton.vue
 ```
