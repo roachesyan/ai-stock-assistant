@@ -1,0 +1,102 @@
+# =========================
+# 1. 操作系统与通用配置 (macOS)
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+*~
+*.swp
+*.swo
+
+# =========================
+# 2. IDE 与编辑器
+# =========================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# =========================
+# 3. 环境变量 (全局)
+# =========================
+.env
+.env.local
+.env.*.local
+.local
+
+# =========================
+# 4. 前端工程 (Vue 3 / Node.js)
+# =========================
+# 依赖目录
+node_modules/
+.npm/
+
+# 日志文件
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# 构建产物与测试覆盖率
+dist/
+dist-ssr/
+build/
+coverage/
+*.tsbuildinfo
+
+# =========================
+# 5. 后端/脚本工程 (Python)
+# =========================
+# 编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 打包产物
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 测试缓存与报告
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hw
+.macbuild
+.pytest_cache/
+.hypothesis/
