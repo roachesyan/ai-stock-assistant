@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -20,8 +21,14 @@ def _envelope_error(code: str, message: str) -> dict:
     return {"success": False, "data": None, "error": {"code": code, "message": message}, "meta": None}
 
 
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    await init_db()
+    yield
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="AI Stock Assistant", version="1.4.0")
+    app = FastAPI(title="AI Stock Assistant", version="1.4.0", lifespan=_lifespan)
 
     app.add_middleware(
         CORSMiddleware,
@@ -29,10 +36,6 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-
-    @app.on_event("startup")
-    async def _startup() -> None:
-        await init_db()
 
     @app.exception_handler(ApiException)
     async def _api_exc_handler(_: Request, exc: ApiException) -> JSONResponse:
