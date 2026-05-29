@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive } from "vue";
 import { message } from "ant-design-vue";
-import dayjs, { Dayjs } from "dayjs";
+import type { Dayjs } from "dayjs";
 import RunTable from "../components/RunTable.vue";
 import { useRunsStore } from "../stores/runs";
 
