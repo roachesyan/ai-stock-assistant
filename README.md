@@ -2,7 +2,6 @@
 
 一个基于 **LangGraph + LangChain** 的多 Agent 量化助手 monorepo：分析师 Agent 生成交易建议，风控 Agent 做 AI 审查，通过后**自动模拟执行** BUY/SELL；人工只能**事后撤销当天的交易**。后端 FastAPI + SQLite，前端 Vue3 + Ant Design Vue。
 
-> ⚠️ 仅供技术研究与学习，所有交易均为**模拟**且**自动执行**，不构成投资建议。
 
 ## 结构
 
