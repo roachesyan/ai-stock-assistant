@@ -480,7 +480,8 @@ npm run dev          # Vite dev server, 默认 http://localhost:5173, 代理 /ap
 
 ```
 ai-stock-assistant/
-├── README.md                       # monorepo 总览 + 启动说明
+├── README.md                       # monorepo 总览 + 启动说明（含 Docker）
+├── docker-compose.yml              # 一键启动 backend + frontend
 ├── spec.md
 ├── CLAUDE.md
 ├── doc/                            # 设计文档
@@ -489,6 +490,8 @@ ai-stock-assistant/
 │
 ├── backend/                        # Python / FastAPI / LangGraph
 │   ├── pyproject.toml
+│   ├── Dockerfile
+│   ├── .dockerignore
 │   ├── .env.example
 │   ├── .gitignore
 │   ├── data/                       # SQLite 数据库文件目录
@@ -549,6 +552,9 @@ ai-stock-assistant/
 │
 └── frontend/                       # Vue3 + Ant Design Vue
     ├── package.json
+    ├── Dockerfile                  # 多阶段：build + nginx
+    ├── nginx.conf                  # 静态托管 + /api 反代到 backend
+    ├── .dockerignore
     ├── vite.config.ts              # dev server + /api 代理
     ├── tsconfig.json
     ├── index.html

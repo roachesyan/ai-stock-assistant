@@ -1,0 +1,32 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    image: ai-stock-assistant-backend
+    env_file:
+      - ./backend/.env
+    environment:
+      # 容器内监听地址与端口
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      # 同源访问，CORS 仅作兜底
+      CORS_ORIGINS: http://localhost:8080
+    volumes:
+      # 持久化 SQLite 数据
+      - backend-data:/app/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: ai-stock-assistant-frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  backend-data:
