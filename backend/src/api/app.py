@@ -13,6 +13,7 @@ from src.api.errors import ApiException
 from src.api.routes import recommendations, runs, trades
 from src.config import settings
 from src.db.init_db import init_db
+from src.scheduler import build_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,14 @@ def _envelope_error(code: str, message: str) -> dict:
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
     await init_db()
-    yield
+    scheduler = build_scheduler()
+    if scheduler is not None:
+        scheduler.start()
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
 
 
 def create_app() -> FastAPI:

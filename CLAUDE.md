@@ -111,6 +111,8 @@ LLM provider (default GLM):
 
 Loop bounds / risk policy: `MAX_SCHEMA_RETRIES` (2), `MAX_EVIDENCE_ROUNDS` (2), `MAX_RISK_ROUNDS` (3), `RISK_LIMIT_POLICY` (EXECUTE_AND_FLAG | DOWNGRADE_TO_HOLD).
 
+Scheduling (server mode only, APScheduler in-process): `SCHEDULE_ENABLED` (false), `SCHEDULE_CRON` (`30 9 * * 1-5`), `SCHEDULE_TIMEZONE` (`America/New_York`), `MARKET_CALENDAR` (`XNYS`), `SKIP_NON_TRADING_DAYS` (true). The scheduled job (`src/scheduler.py`) gates on `is_trading_day` (pandas-market-calendars, skips weekends + holidays), then calls the same `run_pipeline` as the trigger API. Single-instance assumption; re-entrancy guarded.
+
 ## Frontend Pages
 
 - `/history` — run history (filter by status/date/risk_verdict; risk verdict shown as a tag)

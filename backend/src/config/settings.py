@@ -35,6 +35,13 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _get_list(name: str, default: list[str]) -> list[str]:
     raw = os.getenv(name)
     if raw in (None, ""):
@@ -83,6 +90,15 @@ class Settings:
         self.MAX_EVIDENCE_ROUNDS: int = _get_int("MAX_EVIDENCE_ROUNDS", 2)
         self.MAX_RISK_ROUNDS: int = _get_int("MAX_RISK_ROUNDS", 3)
         self.RISK_LIMIT_POLICY: str = _get("RISK_LIMIT_POLICY", "EXECUTE_AND_FLAG")
+
+        # —— 定时调度（仅 Server 模式生效）——
+        self.SCHEDULE_ENABLED: bool = _get_bool("SCHEDULE_ENABLED", False)
+        self.SCHEDULE_CRON: str = _get("SCHEDULE_CRON", "30 9 * * 1-5")
+        self.SCHEDULE_TIMEZONE: str = _get("SCHEDULE_TIMEZONE", "America/New_York")
+        # 交易日历名（pandas-market-calendars），如 XNYS（纽交所）、NASDAQ
+        self.MARKET_CALENDAR: str = _get("MARKET_CALENDAR", "XNYS")
+        # 是否在非交易日跳过（节假日/周末）
+        self.SKIP_NON_TRADING_DAYS: bool = _get_bool("SKIP_NON_TRADING_DAYS", True)
 
         # —— 目标股票 ——
         self.TICKERS: list[str] = _get_list("TICKERS", DEFAULT_TICKERS)

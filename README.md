@@ -117,7 +117,31 @@ docker-compose down -v            # 停止并移除容器 + 数据卷（清空�
 
 ---
 
-## 三、使用流程
+## 四、定时调度（每日自动分析）
+
+后端**常驻进程内置了 APScheduler 调度器**，无需外部 cron——开启后服务自己会在每个**交易日**定时跑一次完整分析并自动执行交易。仅在 **Server 模式**生效。
+
+在 `backend/.env` 中开启：
+
+```ini
+SCHEDULE_ENABLED=true                 # 开启
+SCHEDULE_CRON=30 9 * * 1-5            # 每周一到周五 09:30 触发
+SCHEDULE_TIMEZONE=America/New_York    # 按美东时间解释 cron（美股时区）
+MARKET_CALENDAR=XNYS                  # 交易日历（XNYS=纽交所）
+SKIP_NON_TRADING_DAYS=true            # 节假日/周末自动跳过
+```
+
+要点：
+- 触发逻辑与 `POST /api/run/trigger` 完全一致（同一条 `run_pipeline` 路径），结果照常落库、可在前端查看与撤销。
+- 用 **pandas-market-calendars** 判断交易日：不仅跳过周末，还会跳过**美股节假日**（如元旦、感恩节等）。
+- `SCHEDULE_TIMEZONE` 很关键：cron 时间按它解释。美股是美东时间，和本地（北京时间）不同，请按市场设置。
+- 有防重入保护：上一次还没跑完不会重复触发。
+- **单实例限制**：调度在后端进程内运行，若将来横向扩成多副本会重复触发，届时需加分布式锁或独立调度服务。
+- Docker 部署同理：在 `backend/.env` 设好后 `docker-compose up -d` 即可，无需额外容器。
+
+---
+
+## 五、使用流程
 
 1. 打开前端，点右上角「触发今日分析」（或后端 `POST /api/run/trigger`）。
 2. 后台跑完多 Agent 流程（抓新闻 + 多轮 LLM），将通过风控的 BUY/SELL 自动模拟执行。
@@ -126,6 +150,6 @@ docker-compose down -v            # 停止并移除容器 + 数据卷（清空�
 
 ---
 
-## 四、LLM 提供商
+## 六、LLM 提供商
 
 默认使用智谱 **GLM（glm-5.1）** 的 Anthropic 兼容端点（`LLM_PROVIDER=glm`）。也支持官方 Anthropic（`anthropic`）或 OpenAI / GLM 的 OpenAI 兼容端点（`openai`）。完整变量见 `backend/.env.example` 与 `doc/detailed-design.md` §7。

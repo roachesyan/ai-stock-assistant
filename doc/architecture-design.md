@@ -499,6 +499,7 @@ ai-stock-assistant/
 │   ├── src/
 │   │   ├── __init__.py
 │   │   ├── main.py                 # CLI + Server 入口
+│   │   ├── scheduler.py            # APScheduler 定时调度（Server 模式）(NEW)
 │   │   ├── config/
 │   │   │   ├── settings.py         # 环境变量 & 常量（CORS、循环上限、风控策略）
 │   │   │   └── llm.py              # LLM 客户端工厂
@@ -535,7 +536,8 @@ ai-stock-assistant/
 │   │   │   └── risk_reviewer.py    # 风控 prompt (NEW)
 │   │   └── utils/
 │   │       ├── formatting.py
-│   │       └── dates.py            # 当日判定工具
+│   │       ├── dates.py            # 当日判定工具
+│   │       └── market_calendar.py  # 交易日历（pandas-market-calendars）(NEW)
 │   └── tests/
 │       ├── test_news_scraper.py
 │       ├── test_quant_analyst.py

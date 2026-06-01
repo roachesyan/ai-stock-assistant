@@ -206,9 +206,20 @@ news_scraper → quant_analyst
 系统支持两种运行模式：
 - **CLI 模式**（`python -m src.main`）：运行图一次，自动跑完所有循环（抓取→分析↔证据↔风控→落库→自动执行），控制台打印风控结论与已执行交易，保存到 SQLite，然后退出（无人工交互）。
 - **服务器模式**（`python -m src.main --serve`）：启动 FastAPI 服务器，供前端与外部系统使用。
-  - 分析运行可通过 `POST /api/run/trigger` 触发或定时调度（cron）。
+  - 分析运行可通过 `POST /api/run/trigger` 手动触发，或由**内置定时调度器**（APScheduler）在每个交易日自动触发（见 §4.7）。
   - 触发为**异步**操作（抓新闻 + 多轮 LLM 调用耗时较长）：接口立即返回 `202 Accepted` 与 `run_id`，分析在后台任务中**完整跑完**（含三个循环与自动执行），无需人工介入。
   - 前端通过 `/api/runs`、`/api/runs/{run_id}`、`/api/trades/today` 查询结果，并对当天交易执行撤销。
+
+### 4.7 定时调度（每日自动分析）
+
+服务器模式内置 **APScheduler** 调度器（进程内，随服务一起运行，无需外部 cron）：
+- 由环境变量控制：`SCHEDULE_ENABLED`（默认 `false`）、`SCHEDULE_CRON`（默认 `30 9 * * 1-5`）、`SCHEDULE_TIMEZONE`（默认 `America/New_York`）。
+- 到点回调与 `POST /api/run/trigger` 走**同一条** `run_pipeline` 路径，结果照常落库、可查询、可撤销。
+- **交易日判断**：使用 `pandas-market-calendars`（日历名由 `MARKET_CALENDAR` 配置，默认 `XNYS` 纽交所），在非交易日（周末 + 节假日）自动跳过；由 `SKIP_NON_TRADING_DAYS` 开关控制。
+- **防重入**：上一次分析尚未跑完时跳过本次触发（`max_instances=1` + 内部运行标志）。
+- **时区**：cron 按 `SCHEDULE_TIMEZONE` 解释，需与目标市场一致（美股为美东时间）。
+- **单实例限制**：调度在后端进程内执行；多副本部署会重复触发，届时需引入分布式锁或独立调度服务（MVP 单实例）。
+- 仅在 `--serve` 模式启用；CLI 模式不启动调度器。
 
 ## 5. Web 前端（Vue3 + Ant Design Vue）
 
@@ -446,7 +457,7 @@ VITE_API_BASE_URL=https://your-api-host/api
 
 ### 9.3 依赖清单
 
-- **后端：** 使用 `pyproject.toml` 锁定依赖。核心：`langgraph`、`langchain`、`langchain-anthropic` / `langchain-openai`、`fastapi`、`uvicorn`、`aiosqlite`、`pydantic`、`yfinance`、`tavily-python` / `duckduckgo-search`、`python-dotenv`。（无需 `langgraph-checkpoint-sqlite`：循环在单次 invoke 内完成，无中断恢复需求。）
+- **后端：** 使用 `pyproject.toml` 锁定依赖。核心：`langgraph`、`langchain`、`langchain-anthropic` / `langchain-openai`、`fastapi`、`uvicorn`、`aiosqlite`、`pydantic`、`yfinance`、`tavily-python` / `duckduckgo-search`、`python-dotenv`、`apscheduler`（定时调度）、`pandas-market-calendars`（交易日历）。（无需 `langgraph-checkpoint-sqlite`：循环在单次 invoke 内完成，无中断恢复需求。）
 - **前端：** 使用 `package.json`。核心：`vue`、`ant-design-vue`、`vue-router`、`pinia`、`axios`、`dayjs`；开发依赖：`vite`、`@vitejs/plugin-vue`、`typescript`、`vue-tsc`。
 
 ## 10. 测试策略

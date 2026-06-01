@@ -659,6 +659,11 @@ def now_iso() -> str: return datetime.now().isoformat()
 | `MAX_EVIDENCE_ROUNDS` | No | `2` | 证据补充环上限 |
 | `MAX_RISK_ROUNDS` | No | `3` | 风控反思环上限 |
 | `RISK_LIMIT_POLICY` | No | `EXECUTE_AND_FLAG` | `EXECUTE_AND_FLAG` \| `DOWNGRADE_TO_HOLD` |
+| `SCHEDULE_ENABLED` | No | `false` | 是否启用内置定时调度（仅 Server 模式） |
+| `SCHEDULE_CRON` | No | `30 9 * * 1-5` | cron 表达式（按 `SCHEDULE_TIMEZONE` 解释） |
+| `SCHEDULE_TIMEZONE` | No | `America/New_York` | 调度时区（美股美东时间） |
+| `MARKET_CALENDAR` | No | `XNYS` | pandas-market-calendars 日历名 |
+| `SKIP_NON_TRADING_DAYS` | No | `true` | 非交易日（周末/节假日）自动跳过 |
 
 *按所选 `LLM_PROVIDER` 提供对应的 API Key。`.env` 不得提交版本库（已在 `.gitignore`），仅提交占位符的 `.env.example`。
 
@@ -790,6 +795,59 @@ When rejecting, make issues specific and actionable so the analyst can revise.
 3. POST /api/run/trigger → 后台任务完整跑完（三循环 + 自动执行），202 + run_id
 4. 前端通过 /api/runs/{id}（风控卡片）、/api/trades/today（撤销）查看与操作
 ```
+
+### 9.3 定时调度（APScheduler）
+
+文件：`backend/src/scheduler.py`，仅在 **Server 模式** 由 `create_app()` 的 lifespan 启动。
+
+```python
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+def build_scheduler() -> AsyncIOScheduler | None:
+    if not settings.SCHEDULE_ENABLED:
+        return None
+    scheduler = AsyncIOScheduler(timezone=settings.SCHEDULE_TIMEZONE)
+    trigger = CronTrigger.from_crontab(settings.SCHEDULE_CRON, timezone=settings.SCHEDULE_TIMEZONE)
+    scheduler.add_job(scheduled_run, trigger=trigger, id="daily_analysis",
+                      max_instances=1, coalesce=True, replace_existing=True)
+    return scheduler
+```
+
+`scheduled_run()` 回调流程：
+
+```
+1. SKIP_NON_TRADING_DAYS 且非交易日 → 直接 return（不触发）
+2. 防重入：上一次仍在运行（_running 标志）→ skip
+3. run_pipeline(settings.TICKERS, run_id=uuid)   # 与 /api/run/trigger 同路径
+4. finally: 复位 _running 标志
+```
+
+lifespan 集成（`backend/src/api/app.py`）：
+
+```python
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    await init_db()
+    scheduler = build_scheduler()
+    if scheduler is not None:
+        scheduler.start()
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+```
+
+交易日判断（`backend/src/utils/market_calendar.py`）：
+
+```python
+def is_trading_day(calendar_name: str, day: date | None = None) -> bool:
+    """基于 pandas-market-calendars；周末 + 节假日均判为非交易日。
+    出错时保守返回 True（宁可多跑，不静默漏跑）。"""
+```
+
+> **设计要点：** 与手动触发同一执行路径；防重入 + `max_instances=1`；时区按 `SCHEDULE_TIMEZONE`；非交易日自动跳过；单实例假设（多副本需分布式锁）。
 
 ---
 
@@ -958,6 +1016,8 @@ dependencies = [
     "uvicorn>=0.29",
     "aiosqlite>=0.20",
     "pydantic>=2.0",
+    "apscheduler>=3.10",
+    "pandas-market-calendars>=4.3",
 ]
 
 [project.optional-dependencies]
